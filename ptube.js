@@ -1,12 +1,12 @@
 /*!
- * PipeTube — YouTube в Lampa / ByLampa через инстансы Piped
- * v0.1.1
+ * PipeTube — YouTube в Lampa / ByLampa через инстансы Invidious
+ * v0.2.0
  *
- * - список инстансов Piped, проверка (API + прокси видео), выбор лучшего, ручной выбор, свой URL
+ * - список инстансов Invidious, проверка (API + прокси видео), выбор лучшего, ручной выбор, свой URL
  * - автопереключение инстанса при сбое
  * - главная: рекомендации (по истории), новое в подписках, тренды
  * - поиск, страница канала, подписки (локальные + импорт из Google), история
- * - воспроизведение HLS / MP4 через прокси Piped, прогресс через Lampa.Timeline
+ * - воспроизведение MP4 / DASH через прокси инстанса (local=true), прогресс через Lampa.Timeline
  * - SponsorBlock
  */
 (function () {
@@ -15,7 +15,7 @@
   if (window.ptube_loaded) return;
   window.ptube_loaded = true;
 
-  var VERSION = '0.1.1';
+  var VERSION = '0.2.0';
 
   var CFG = {
     // Google OAuth-клиент типа «TVs and Limited Input devices» с включённым YouTube Data API v3.
@@ -24,19 +24,21 @@
     GOOGLE_CLIENT_SECRET: '',
     GOOGLE_SCOPE: 'https://www.googleapis.com/auth/youtube.readonly',
 
-    INSTANCES_URL: 'https://piped-instances.kavin.rocks/',
+    INSTANCES_URL: 'https://api.invidious.io/instances.json?sort_by=health',
     FALLBACK: [
-      'https://pipedapi.kavin.rocks',
-      'https://pipedapi.adminforge.de',
-      'https://pipedapi.leptons.xyz',
-      'https://api.piped.private.coffee',
-      'https://pipedapi.reallyaweso.me',
-      'https://pipedapi.drgns.space',
-      'https://pipedapi.ducks.party',
-      'https://piped-api.privacy.com.de',
-      'https://pipedapi.nosebs.ru',
-      'https://pipedapi.r4fo.com'
+      'https://inv.nadeko.net',
+      'https://yewtu.be',
+      'https://invidious.nerdvpn.de',
+      'https://inv.tux.pizza',
+      'https://invidious.f5.si',
+      'https://iv.melmac.space',
+      'https://invidious.privacyredirect.com',
+      'https://inv.perditum.com'
     ],
+    SB_API: 'https://sponsor.ajay.app/api/skipSegments',
+    FEED_PER_CHANNEL: 6,
+    FEED_CONCURRENCY: 4,
+    FEED_TTL: 30 * 60 * 1000,
     TEST_VIDEO: 'jNQXAC9IVRw',
     TEST_QUERIES: ['music', 'news', 'cooking', 'travel', 'review', 'podcast', 'lecture', 'football'],
     PLAY_TRIES: 8,
@@ -204,7 +206,7 @@
   }
 
   /* ============================================================
-   * Инстансы Piped
+   * Инстансы Invidious
    * ============================================================ */
   function sortInstances(items) {
     items.sort(function (a, b) {
@@ -215,25 +217,43 @@
   }
 
   function probeUrl(s) {
-    if (s.hls) return s.hls;
-    var v = s.videoStreams || [];
-    for (var i = 0; i < v.length; i++) if (!v[i].videoOnly && v[i].url) return v[i].url;
-    return v[0] && v[0].url || '';
+    var f = s.formatStreams || [];
+    for (var i = 0; i < f.length; i++) if (f[i].url) return f[i].url;
+    return dashOf(s) || s.hlsUrl || '';
+  }
+  function dashOf(s) {
+    if (!s.dashUrl) return '';
+    return /[?&]local=/.test(s.dashUrl) ? s.dashUrl : s.dashUrl + (s.dashUrl.indexOf('?') < 0 ? '?' : '&') + 'local=true';
+  }
+
+  // Invidious с local=true отдаёт относительные ссылки (/videoplayback, /vi/…, /api/v1/captions/…)
+  function absolutize(o, base, depth) {
+    depth = depth || 0;
+    if (!o || typeof o !== 'object' || depth > 6) return o;
+    for (var k in o) {
+      if (!Object.prototype.hasOwnProperty.call(o, k)) continue;
+      var v = o[k];
+      if (typeof v === 'string' && (k === 'url' || k === 'dashUrl' || k === 'hlsUrl')) {
+        if (v.slice(0, 2) === '//') o[k] = 'https:' + v;
+        else if (v.charAt(0) === '/') o[k] = base + v;
+      } else if (v && typeof v === 'object') absolutize(v, base, depth + 1);
+    }
+    return o;
   }
 
   var Inst = {
     _checking: null,
-    data: function () { return store.get('ptube_instances', { at: 0, items: [] }); },
-    save: function (d) { store.set('ptube_instances', d); },
-    selected: function () { return store.get('ptube_selected', ''); },
-    select: function (api) { store.set('ptube_selected', api || ''); },
+    data: function () { return store.get('ptube_inv_instances', { at: 0, items: [] }); },
+    save: function (d) { store.set('ptube_inv_instances', d); },
+    selected: function () { return store.get('ptube_inv_selected', ''); },
+    select: function (api) { store.set('ptube_inv_selected', api || ''); },
     manual: function () { return !!this.selected(); },
-    customs: function () { return store.get('ptube_custom', []); },
+    customs: function () { return store.get('ptube_inv_custom', []); },
     addCustom: function (url) {
       url = normApi(url);
       if (!url) return '';
       var c = this.customs();
-      if (c.indexOf(url) < 0) { c.unshift(url); store.set('ptube_custom', c); }
+      if (c.indexOf(url) < 0) { c.unshift(url); store.set('ptube_inv_custom', c); }
       var d = this.data();
       if (!d.items.some(function (i) { return i.api === url; })) { d.items.push({ api: url, name: hostOf(url), custom: true }); this.save(d); }
       return url;
@@ -258,8 +278,12 @@
     candidates: function () {
       var self = this;
       return http(CFG.INSTANCES_URL, { timeout: 7000 }).then(function (r) {
-        return (Array.isArray(r.data) ? r.data : []).filter(function (i) { return i && i.api_url; }).map(function (i) {
-          return { api: normApi(i.api_url), name: i.name || hostOf(i.api_url), loc: i.locations || '' };
+        // формат: [[host, {type, api, cors, uri, region, ...}], ...]; без CORS приложение к инстансу не достучится
+        return (Array.isArray(r.data) ? r.data : []).filter(function (x) {
+          var m = x && x[1];
+          return m && m.type === 'https' && m.api !== false && m.cors !== false && m.uri;
+        }).map(function (x) {
+          return { api: normApi(x[1].uri), name: x[0], loc: x[1].region || '' };
         });
       }).catch(function (e) { log('instances list', e.message); return []; }).then(function (list) {
         var seen = {}, out = [];
@@ -274,19 +298,18 @@
     // и не показывают бот-блокировку YouTube.
     freshVideo: function (inst) {
       var q = CFG.TEST_QUERIES[Math.floor(Math.random() * CFG.TEST_QUERIES.length)];
-      return http(inst.api + '/search?q=' + enc(q) + '&filter=videos', { timeout: CFG.CHECK_TIMEOUT }).then(function (r) {
-        var items = normList((r.data && r.data.items) || []).filter(function (v) { return v.kind === 'video' && v.duration > 0; });
+      return http(inst.api + '/api/v1/search?q=' + enc(q) + '&type=video', { timeout: CFG.CHECK_TIMEOUT }).then(function (r) {
+        var items = normList(Array.isArray(r.data) ? r.data : []).filter(function (v) { return v.kind === 'video' && v.duration > 0; });
         if (!items.length) return CFG.TEST_VIDEO;
         return items[Math.floor(Math.random() * Math.min(items.length, 10))].id;
       }, function () { return CFG.TEST_VIDEO; });
     },
 
     test: function (inst) {
-      var self = this;
       return this.freshVideo(inst).then(function (id) {
-        return http(inst.api + '/streams/' + id, { timeout: CFG.CHECK_TIMEOUT });
+        return http(inst.api + '/api/v1/videos/' + id + '?local=true', { timeout: CFG.CHECK_TIMEOUT });
       }).then(function (r) {
-        var s = r.data || {};
+        var s = absolutize(r.data || {}, inst.api);
         if (s.error) throw mkErr(s.message || s.error);
         var url = probeUrl(s);
         if (!url) throw mkErr('нет потоков');
@@ -325,7 +348,7 @@
       if (b) { this.check().catch(function () {}); return Promise.resolve(b.api); }
       return this.check().then(function () {
         var b2 = self.best();
-        if (!b2) throw mkErr('Нет доступных инстансов Piped');
+        if (!b2) throw mkErr('Нет доступных инстансов Invidious');
         return b2.api;
       });
     },
@@ -355,7 +378,7 @@
     opt = opt || {};
     function attempt(left, lastErr) {
       return Inst.ensure().then(function (base) {
-        return http(base + path, { timeout: opt.timeout }).then(function (r) { return r.data; }, function (e) {
+        return http(base + path, { timeout: opt.timeout }).then(function (r) { return absolutize(r.data, base); }, function (e) {
           if (left > 0 && !Inst.manual() && shouldFailover(e)) {
             Inst.markBad(base, e.message);
             return attempt(left - 1, e);
@@ -375,21 +398,31 @@
   /* ============================================================
    * Модель
    * ============================================================ */
+  function pickThumb(arr) {
+    arr = arr || [];
+    var pref = ['medium', 'high', 'sddefault', 'default'];
+    for (var p = 0; p < pref.length; p++) for (var i = 0; i < arr.length; i++) if (arr[i].quality === pref[p] && arr[i].url) return arr[i].url;
+    return arr[0] && arr[0].url || '';
+  }
+  function pickAvatar(arr) {
+    arr = (arr || []).filter(function (a) { return a && a.url; }).sort(function (a, b) { return (a.width || 0) - (b.width || 0); });
+    for (var i = 0; i < arr.length; i++) if ((arr[i].width || 0) >= 100) return arr[i].url;
+    return arr.length ? arr[arr.length - 1].url : '';
+  }
+
   function normItem(i) {
     if (!i) return null;
     if (i.type === 'channel') {
-      var cid = chId(i.url);
-      if (!cid) return null;
-      return { kind: 'channel', id: cid, name: i.name || '', avatar: i.thumbnail || '', subs: i.subscribers, videos: i.videos };
+      if (!i.authorId) return null;
+      return { kind: 'channel', id: i.authorId, name: i.author || '', avatar: pickAvatar(i.authorThumbnails), subs: i.subCount, videos: i.videoCount };
     }
-    if (i.type && i.type !== 'stream') return null;
-    var id = vidId(i.url);
-    if (!id) return null;
+    if (i.type && i.type !== 'video' && i.type !== 'shortVideo') return null;
+    if (!i.videoId) return null;
     return {
-      kind: 'video', id: id, title: i.title || '', thumb: i.thumbnail || '',
-      channel: i.uploaderName || '', channelId: chId(i.uploaderUrl), avatar: i.uploaderAvatar || '',
-      duration: i.duration, views: i.views, uploaded: i.uploaded, uploadedText: i.uploadedDate || '',
-      short: !!i.isShort || /\/shorts\//.test(i.url || '')
+      kind: 'video', id: i.videoId, title: i.title || '', thumb: pickThumb(i.videoThumbnails),
+      channel: i.author || '', channelId: i.authorId || '', avatar: '',
+      duration: i.liveNow ? -1 : i.lengthSeconds, views: i.viewCount, uploaded: i.published > 0 ? i.published * 1000 : 0,
+      uploadedText: i.publishedText || '', short: !!i.isShort || i.type === 'shortVideo'
     };
   }
   function compact(v) {
@@ -455,24 +488,34 @@
     }
   };
 
+  // У Invidious нет анонимной ленты: собираем по каналам, кэшируем
   function loadFeed() {
-    var ids = Subs.list().map(function (s) { return s.id; });
-    if (!ids.length) return Promise.resolve([]);
-    var chunks = [];
-    for (var i = 0; i < ids.length; i += CFG.FEED_CHUNK) chunks.push(ids.slice(i, i + CFG.FEED_CHUNK));
-    return Promise.all(chunks.map(function (c) {
-      return api('/feed/unauthenticated?channels=' + c.join(',')).catch(function (e) { log('feed', e.message); return []; });
-    })).then(function (arrs) {
+    var subs = Subs.list();
+    if (!subs.length) return Promise.resolve([]);
+    var key = subs.map(function (x) { return x.id; }).sort().join(',');
+    var cache = store.get('ptube_feed_cache', null);
+    if (cache && cache.key === key && Date.now() - cache.at < CFG.FEED_TTL) return Promise.resolve(cache.items);
+    return pool(subs, CFG.FEED_CONCURRENCY, function (ch) {
+      return api('/api/v1/channels/' + ch.id + '/videos', { failover: false }).then(function (d) {
+        return normList((d && d.videos) || []).filter(function (v) { return v.kind === 'video'; }).slice(0, CFG.FEED_PER_CHANNEL);
+      });
+    }).then(function (res) {
       var all = [];
-      arrs.forEach(function (a) { if (Array.isArray(a)) all = all.concat(a); });
-      return normList(all).filter(function (v) { return v.kind === 'video'; })
+      res.forEach(function (a) { if (a) all = all.concat(a); });
+      var seen = {};
+      all = all.filter(function (v) { if (seen[v.id]) return false; seen[v.id] = 1; return true; })
         .sort(function (a, b) { return (b.uploaded || 0) - (a.uploaded || 0); })
-        .slice(0, CFG.FEED_MAX);
+        .slice(0, CFG.FEED_MAX).map(compact);
+      if (all.length) store.set('ptube_feed_cache', { key: key, at: Date.now(), items: all });
+      return all;
     });
   }
 
   function loadTrending() {
-    return api('/trending?region=' + setting('ptube_region', 'RU')).then(function (d) {
+    return api('/api/v1/trending?region=' + setting('ptube_region', 'RU'), { failover: false }).then(function (d) {
+      if (!Array.isArray(d) || !d.length) throw mkErr('пусто');
+      return d;
+    }).catch(function () { return api('/api/v1/popular', { failover: false }); }).then(function (d) {
       return normList(Array.isArray(d) ? d : []).filter(function (v) { return v.kind === 'video'; });
     });
   }
@@ -511,17 +554,19 @@
    * Воспроизведение + SponsorBlock
    * ============================================================ */
   function buildQuality(s) {
-    var map = {}, muxed = (s.videoStreams || []).filter(function (x) { return !x.videoOnly && x.url; })
-      .sort(function (a, b) { return (parseInt(b.quality, 10) || 0) - (parseInt(a.quality, 10) || 0); });
-    if (s.hls) map['Авто (HLS)'] = s.hls;
+    var map = {}, muxed = (s.formatStreams || []).filter(function (x) { return x.url; })
+      .sort(function (a, b) { return (parseInt(b.resolution || b.qualityLabel || b.quality, 10) || 0) - (parseInt(a.resolution || a.qualityLabel || a.quality, 10) || 0); });
+    var dash = dashOf(s);
     muxed.forEach(function (x) {
-      var k = (x.quality || '?') + (x.format ? ' ' + x.format : '');
+      var k = (x.resolution || x.qualityLabel || x.quality || '?') + ' MP4';
       if (!map[k]) map[k] = x.url;
     });
-    var pref = setting('ptube_quality', 'hls'), first = '';
-    if (s.livestream) first = s.hls || '';
-    else if (pref === 'hls') first = s.hls || (muxed[0] && muxed[0].url) || '';
-    else first = (muxed[0] && muxed[0].url) || s.hls || '';
+    if (dash) map['DASH (до 1080p)'] = dash;
+    if (s.hlsUrl) map['HLS'] = s.hlsUrl;
+    var pref = setting('ptube_quality', 'mp4'), first = '';
+    if (s.liveNow) first = s.hlsUrl || dash || '';
+    else if (pref === 'dash') first = dash || (muxed[0] && muxed[0].url) || '';
+    else first = (muxed[0] && muxed[0].url) || dash || '';
     return { map: map, first: first };
   }
 
@@ -537,9 +582,9 @@
       this.segs = [];
       if (!SB_CATS[mode]) return;
       this.vid = id;
-      api('/sponsors/' + id + '?category=' + enc(JSON.stringify(SB_CATS[mode])), { failover: false, timeout: 8000 }).then(function (d) {
+      http(CFG.SB_API + '?videoID=' + id + '&categories=' + enc(JSON.stringify(SB_CATS[mode])), { timeout: 8000 }).then(function (r) {
         if (self.vid !== id) return;
-        self.segs = ((d && d.segments) || []).filter(function (s) { return s.segment && s.segment[1] > s.segment[0]; })
+        self.segs = (Array.isArray(r.data) ? r.data : []).filter(function (s) { return s.segment && s.segment[1] > s.segment[0]; })
           .map(function (s) { return { a: +s.segment[0], b: +s.segment[1], cat: s.category, done: false }; });
         log('sponsor segments', self.segs.length);
       }).catch(function () {});
@@ -563,34 +608,34 @@
     opt = opt || {};
     var cancelled = false;
     try { Lampa.Loading.start(function () { cancelled = true; Lampa.Loading.stop(); }); } catch (e) {}
-    return api('/streams/' + v.id, { tries: CFG.PLAY_TRIES }).then(function (s) {
+    return api('/api/v1/videos/' + v.id + '?local=true', { tries: CFG.PLAY_TRIES }).then(function (s) {
       try { Lampa.Loading.stop(); } catch (e) {}
       if (cancelled) return;
       if (!s || s.error) throw mkErr((s && (s.message || s.error)) || 'пустой ответ');
       var q = buildQuality(s);
       if (opt.mp4) {
-        var mp4 = (s.videoStreams || []).filter(function (x) { return !x.videoOnly && x.url; })[0];
+        var mp4 = (s.formatStreams || []).filter(function (x) { return x.url; })[0];
         if (mp4) q.first = mp4.url;
       }
       if (!q.first) { noty('Нет воспроизводимых потоков'); return; }
 
       var item = extend({}, v, {
-        kind: 'video', title: s.title || v.title, thumb: s.thumbnailUrl || v.thumb,
-        channel: s.uploader || v.channel, channelId: chId(s.uploaderUrl) || v.channelId, duration: s.duration || v.duration
+        kind: 'video', title: s.title || v.title, thumb: pickThumb(s.videoThumbnails) || v.thumb,
+        channel: s.author || v.channel, channelId: s.authorId || v.channelId, duration: s.lengthSeconds || v.duration
       });
-      History.add(item, normList(s.relatedStreams).filter(function (x) { return x.kind === 'video'; }));
+      History.add(item, normList(s.recommendedVideos).filter(function (x) { return x.kind === 'video'; }));
 
       var data = { title: item.title, url: q.first, quality: q.map };
       var tl = timelineFor(v.id);
-      if (tl && !s.livestream) data.timeline = tl;
-      var subs = (s.subtitles || []).filter(function (t) { return t.url && /vtt|srt/i.test(t.mimeType || t.url); }).map(function (t) {
-        return { label: (t.name || t.code || '?') + (t.autoGenerated ? ' (авто)' : ''), url: t.url };
+      if (tl && !s.liveNow) data.timeline = tl;
+      var subs = (s.captions || []).filter(function (t) { return t.url; }).map(function (t) {
+        return { label: t.label || t.language_code || '?', url: t.url };
       });
       if (subs.length) data.subtitles = subs;
 
       Lampa.Player.play(data);
       try { Lampa.Player.playlist([data]); } catch (e) {}
-      if (!s.livestream) Sponsor.load(v.id); else Sponsor.reset();
+      if (!s.liveNow) Sponsor.load(v.id); else Sponsor.reset();
       return data;
     }).catch(function (e) {
       try { Lampa.Loading.stop(); } catch (er) {}
@@ -737,10 +782,10 @@
       items.push({ title: (i.custom ? '★ ' : '') + i.name, subtitle: instDescr(i).replace(i.name + ' — ', ''), selected: sel === i.api, act: 'pick', api: i.api, ghost: !i.ok });
     });
     items.push({ title: 'Перепроверить все', subtitle: d.at ? 'последняя проверка: ' + fmtAgo(d.at) : 'ещё не проверялись', act: 'check' });
-    items.push({ title: 'Добавить свой URL API', subtitle: 'например pipedapi.example.com', act: 'custom' });
+    items.push({ title: 'Добавить свой инстанс', subtitle: 'например inv.example.com', act: 'custom' });
 
     Lampa.Select.show({
-      title: 'Инстанс Piped',
+      title: 'Инстанс Invidious',
       items: items,
       onBack: function () { Lampa.Controller.toggle(back); },
       onSelect: function (a) {
@@ -754,7 +799,7 @@
             showInstanceMenu(back);
           }).catch(function (e) { noty('Проверка: ' + e.message); });
         } else if (a.act === 'custom') {
-          Lampa.Input.edit({ title: 'URL API Piped', value: '', free: true, nosave: true }, function (val) {
+          Lampa.Input.edit({ title: 'URL инстанса Invidious', value: '', free: true, nosave: true }, function (val) {
             var url = Inst.addCustom(val);
             if (!url) { Lampa.Controller.toggle(back); return; }
             noty('Проверяю ' + hostOf(url) + '…');
@@ -815,7 +860,7 @@
     var items = [];
     if (v.kind === 'video') {
       items.push({ title: 'Воспроизвести', act: function () { play(v); } });
-      items.push({ title: 'Воспроизвести MP4 (совместимость)', act: function () { play(v, { mp4: true }); } });
+      items.push({ title: 'Воспроизвести MP4 (360p)', act: function () { play(v, { mp4: true }); } });
     }
     var cid = v.kind === 'channel' ? v.id : v.channelId;
     if (cid) {
@@ -946,7 +991,7 @@
         view(object, ui);
       }, function (e) {
         if (!alive) return;
-        ui.title('Нет доступного инстанса Piped', e.message || '');
+        ui.title('Нет доступного инстанса Invidious', e.message || '');
         ui.head([['Выбрать инстанс', function () { showInstanceMenu('content'); }]]);
       }).then(function () {
         if (!alive) return;
@@ -984,10 +1029,16 @@
   /* ============================================================
    * Экраны
    * ============================================================ */
-  function pageOf(path, nextPath) {
-    return api(path).then(function (d) {
-      var items = normList(d.items || d.relatedStreams || []);
-      return { items: items, next: d.nextpage ? function () { return pageOf(nextPath(d.nextpage), nextPath); } : null, raw: d };
+  function searchPage(q, page) {
+    return api('/api/v1/search?q=' + enc(q) + '&type=all&page=' + page).then(function (d) {
+      var items = normList(Array.isArray(d) ? d : []);
+      return { items: items, next: items.length && page < 10 ? function () { return searchPage(q, page + 1); } : null };
+    });
+  }
+  function channelPage(id, cont) {
+    return api('/api/v1/channels/' + id + '/videos' + (cont ? '?continuation=' + enc(cont) : '')).then(function (d) {
+      var items = normList((d && d.videos) || []);
+      return { items: items, next: d && d.continuation && items.length ? function () { return channelPage(id, d.continuation); } : null };
     });
   }
 
@@ -1018,9 +1069,7 @@
     search: function (o, ui) {
       ui.head([['Новый поиск', searchPrompt]]);
       var q = o.query || '';
-      ui.paged(ui.section('Результаты: ' + q), pageOf('/search?q=' + enc(q) + '&filter=all', function (np) {
-        return '/nextpage/search?q=' + enc(q) + '&filter=all&nextpage=' + enc(np);
-      }), 'Ничего не найдено');
+      ui.paged(ui.section('Результаты: ' + q), searchPage(q, 1), 'Ничего не найдено');
     },
 
     channel: function (o, ui) {
@@ -1031,19 +1080,19 @@
         else { Subs.add({ id: id, name: title.find('.ptube-title__name').text(), avatar: title.data('avatar') }); el.text('Отписаться'); noty('Подписка оформлена'); }
       }]]);
       var sec = ui.section('Видео');
-      var p = pageOf('/channel/' + id, function (np) { return '/nextpage/channel/' + id + '?nextpage=' + enc(np); });
-      p.then(function (r) {
-        var d = r.raw || {};
-        title.find('.ptube-title__name').text(d.name || o.title || '');
-        title.find('.ptube-title__sub').text(d.subscriberCount > 0 ? fmtNum(d.subscriberCount) + ' подписчиков' : '');
-        title.data('avatar', d.avatarUrl || '');
-        if (Subs.has(id) && d.avatarUrl) {
+      api('/api/v1/channels/' + id + '?fields=author,authorThumbnails,subCount').then(function (d) {
+        d = d || {};
+        var av = pickAvatar(d.authorThumbnails);
+        title.find('.ptube-title__name').text(d.author || o.title || '');
+        title.find('.ptube-title__sub').text(d.subCount > 0 ? fmtNum(d.subCount) + ' подписчиков' : '');
+        title.data('avatar', av);
+        if (Subs.has(id) && av) {
           var l = Subs.list();
-          l.forEach(function (s) { if (s.id === id) { s.avatar = d.avatarUrl; s.name = d.name || s.name; } });
+          l.forEach(function (s) { if (s.id === id) { s.avatar = av; s.name = d.author || s.name; } });
           store.set('ptube_subs', l);
         }
       }, function () {});
-      ui.paged(sec, p, 'На канале нет видео');
+      ui.paged(sec, channelPage(id, ''), 'На канале нет видео');
     },
 
     subs: function (o, ui) {
@@ -1082,14 +1131,14 @@
       });
     }
 
-    button('ptube_inst_btn', 'Инстанс Piped', function () {
+    button('ptube_inst_btn', 'Инстанс Invidious', function () {
       var c = Inst.current();
       return (Inst.manual() ? 'Вручную: ' : 'Авто: ') + instDescr(c);
     }, function () { showInstanceMenu('settings_component'); });
 
     Lampa.SettingsApi.addParam({
-      component: 'ptube', param: { name: 'ptube_quality', type: 'select', values: { hls: 'HLS (до 1080p)', mp4: 'MP4 (360p, совместимость)' }, 'default': 'hls' },
-      field: { name: 'Поток по умолчанию', description: 'Если HLS не играет на устройстве — переключите на MP4' }
+      component: 'ptube', param: { name: 'ptube_quality', type: 'select', values: { mp4: 'MP4 (обычно 360p, играет везде)', dash: 'DASH (до 1080p, если плеер умеет)' }, 'default': 'mp4' },
+      field: { name: 'Поток по умолчанию', description: 'DASH даёт высокое качество, но не каждый плеер его поддерживает' }
     });
     Lampa.SettingsApi.addParam({
       component: 'ptube', param: { name: 'ptube_region', type: 'select', values: REGIONS, 'default': 'RU' },
@@ -1151,6 +1200,7 @@
   function start() {
     if (window.ptube_started) return;
     window.ptube_started = true;
+    ['ptube_instances', 'ptube_selected', 'ptube_custom'].forEach(store.del); // кэш версии на Piped
     $('head').append('<style id="ptube-css">' + CSS + '</style>');
     Lampa.Component.add('ptube', Component);
     addMenu();
@@ -1164,7 +1214,7 @@
 
   window.ptube = {
     version: VERSION, CFG: CFG, Inst: Inst, api: api, play: play, Subs: Subs, History: History, Google: Google, Sponsor: Sponsor,
-    _t: { buildRecs: buildRecs, buildQuality: buildQuality, loadFeed: loadFeed, normList: normList, shouldFailover: shouldFailover, Views: Views, Component: Component, start: start }
+    _t: { absolutize: absolutize, buildRecs: buildRecs, buildQuality: buildQuality, loadFeed: loadFeed, normList: normList, shouldFailover: shouldFailover, Views: Views, Component: Component, start: start }
   };
 
   if (window.appready) start();
