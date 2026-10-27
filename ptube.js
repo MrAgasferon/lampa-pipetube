@@ -1,6 +1,6 @@
 /*!
  * PipeTube — YouTube в Lampa / ByLampa через инстансы Invidious
- * v0.2.0
+ * v0.2.1
  *
  * - список инстансов Invidious, проверка (API + прокси видео), выбор лучшего, ручной выбор, свой URL
  * - автопереключение инстанса при сбое
@@ -15,7 +15,7 @@
   if (window.ptube_loaded) return;
   window.ptube_loaded = true;
 
-  var VERSION = '0.2.0';
+  var VERSION = '0.2.1';
 
   var CFG = {
     // Google OAuth-клиент типа «TVs and Limited Input devices» с включённым YouTube Data API v3.
@@ -604,6 +604,30 @@
     reset: function () { this.vid = null; this.segs = []; }
   };
 
+  // Плеер для YouTube отдельно от общих настроек Lampa:
+  //  lampa   — как для онлайн-просмотра (общая настройка Lampa «Плеер»)
+  //  torrent — как для торрентов (настройка «Плеер для торрентов»)
+  //  external — всегда внешний плеер Android
+  function canExternal() {
+    try { return Lampa.Platform.is('android') && !!(Lampa.Android && Lampa.Android.openPlayer); } catch (e) { return false; }
+  }
+  function launch(data) {
+    var mode = setting('ptube_player', 'lampa');
+    if (mode === 'torrent') {
+      var t = 'inner';
+      try { t = Lampa.Storage.field('player_torrent'); } catch (e) {}
+      mode = t && t !== 'inner' ? 'external' : 'lampa';
+    }
+    if (mode === 'external') {
+      if (canExternal()) {
+        try { Lampa.Android.openPlayer(data.url, data); return true; } catch (e) { log('external player', e); }
+      } else noty('Внешний плеер доступен только в приложении на Android');
+    }
+    Lampa.Player.play(data);
+    try { Lampa.Player.playlist([data]); } catch (e) {}
+    return false;
+  }
+
   function play(v, opt) {
     opt = opt || {};
     var cancelled = false;
@@ -633,9 +657,8 @@
       });
       if (subs.length) data.subtitles = subs;
 
-      Lampa.Player.play(data);
-      try { Lampa.Player.playlist([data]); } catch (e) {}
-      if (!s.liveNow) Sponsor.load(v.id); else Sponsor.reset();
+      var ext = launch(data);
+      if (!s.liveNow && !ext) Sponsor.load(v.id); else Sponsor.reset();
       return data;
     }).catch(function (e) {
       try { Lampa.Loading.stop(); } catch (er) {}
@@ -1147,6 +1170,10 @@
     Lampa.SettingsApi.addParam({
       component: 'ptube', param: { name: 'ptube_hide_shorts', type: 'trigger', 'default': true },
       field: { name: 'Скрывать Shorts' }
+    });
+    Lampa.SettingsApi.addParam({
+      component: 'ptube', param: { name: 'ptube_player', type: 'select', values: { lampa: 'Как для онлайн (общий «Плеер»)', torrent: 'Как для торрентов', external: 'Внешний (Android)' }, 'default': 'lampa' },
+      field: { name: 'Плеер', description: 'Отдельно от общих настроек Lampa. SponsorBlock работает только во встроенном плеере' }
     });
     Lampa.SettingsApi.addParam({
       component: 'ptube', param: { name: 'ptube_sponsor', type: 'select', values: { off: 'Выключен', sponsor: 'Только спонсорские вставки', all: 'Спонсоры, самопиар, заставки, концовки' }, 'default': 'sponsor' },
