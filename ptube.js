@@ -1,6 +1,6 @@
 /*!
  * PipeTube — YouTube в Lampa / ByLampa через инстансы Piped
- * v0.1.0
+ * v0.1.1
  *
  * - список инстансов Piped, проверка (API + прокси видео), выбор лучшего, ручной выбор, свой URL
  * - автопереключение инстанса при сбое
@@ -15,7 +15,7 @@
   if (window.ptube_loaded) return;
   window.ptube_loaded = true;
 
-  var VERSION = '0.1.0';
+  var VERSION = '0.1.1';
 
   var CFG = {
     // Google OAuth-клиент типа «TVs and Limited Input devices» с включённым YouTube Data API v3.
@@ -38,6 +38,8 @@
       'https://pipedapi.r4fo.com'
     ],
     TEST_VIDEO: 'jNQXAC9IVRw',
+    TEST_QUERIES: ['music', 'news', 'cooking', 'travel', 'review', 'podcast', 'lecture', 'football'],
+    PLAY_TRIES: 8,
     CHECK_TTL: 6 * 3600 * 1000,
     CHECK_TIMEOUT: 8000,
     REQ_TIMEOUT: 15000,
@@ -268,8 +270,22 @@
       });
     },
 
+    // Свежее видео из поиска на самом инстансе: популярное тестовое видео инстансы отдают из кэша
+    // и не показывают бот-блокировку YouTube.
+    freshVideo: function (inst) {
+      var q = CFG.TEST_QUERIES[Math.floor(Math.random() * CFG.TEST_QUERIES.length)];
+      return http(inst.api + '/search?q=' + enc(q) + '&filter=videos', { timeout: CFG.CHECK_TIMEOUT }).then(function (r) {
+        var items = normList((r.data && r.data.items) || []).filter(function (v) { return v.kind === 'video' && v.duration > 0; });
+        if (!items.length) return CFG.TEST_VIDEO;
+        return items[Math.floor(Math.random() * Math.min(items.length, 10))].id;
+      }, function () { return CFG.TEST_VIDEO; });
+    },
+
     test: function (inst) {
-      return http(inst.api + '/streams/' + CFG.TEST_VIDEO, { timeout: CFG.CHECK_TIMEOUT }).then(function (r) {
+      var self = this;
+      return this.freshVideo(inst).then(function (id) {
+        return http(inst.api + '/streams/' + id, { timeout: CFG.CHECK_TIMEOUT });
+      }).then(function (r) {
         var s = r.data || {};
         if (s.error) throw mkErr(s.message || s.error);
         var url = probeUrl(s);
@@ -325,7 +341,7 @@
 
   function contentError(e) {
     var m = (e && e.message || '') + ' ' + (e && e.data ? JSON.stringify(e.data) : '');
-    if (/bot|sign in|login_required|confirm you/i.test(m)) return false;
+    if (/bot|sign.?in|log.?in|login_required|confirm you|anonym|po.?token/i.test(m)) return false;
     return /unavailable|private|removed|not available|copyright|terminated|age.?restrict|inappropriate|does not exist|no longer|members.only/i.test(m);
   }
   function shouldFailover(e) {
@@ -337,18 +353,23 @@
 
   function api(path, opt) {
     opt = opt || {};
-    function attempt(left) {
+    function attempt(left, lastErr) {
       return Inst.ensure().then(function (base) {
         return http(base + path, { timeout: opt.timeout }).then(function (r) { return r.data; }, function (e) {
           if (left > 0 && !Inst.manual() && shouldFailover(e)) {
             Inst.markBad(base, e.message);
-            return attempt(left - 1);
+            return attempt(left - 1, e);
           }
           throw e;
         });
-      });
+      }, function (e) { throw lastErr || e; });
     }
-    return attempt(opt.failover === false ? 0 : 2);
+    return attempt(opt.failover === false ? 0 : (opt.tries || 2));
+  }
+
+  function isBotBlock(e) {
+    var m = (e && e.message || '') + ' ' + (e && e.data ? JSON.stringify(e.data) : '');
+    return /bot|sign.?in|log.?in|login_required|confirm you|anonym|po.?token/i.test(m);
   }
 
   /* ============================================================
@@ -542,7 +563,7 @@
     opt = opt || {};
     var cancelled = false;
     try { Lampa.Loading.start(function () { cancelled = true; Lampa.Loading.stop(); }); } catch (e) {}
-    return api('/streams/' + v.id).then(function (s) {
+    return api('/streams/' + v.id, { tries: CFG.PLAY_TRIES }).then(function (s) {
       try { Lampa.Loading.stop(); } catch (e) {}
       if (cancelled) return;
       if (!s || s.error) throw mkErr((s && (s.message || s.error)) || 'пустой ответ');
@@ -573,7 +594,12 @@
       return data;
     }).catch(function (e) {
       try { Lampa.Loading.stop(); } catch (er) {}
-      if (!cancelled) noty('Не удалось открыть видео: ' + (e.message || e));
+      if (!cancelled) {
+        if (isBotBlock(e)) noty(Inst.manual()
+          ? 'YouTube блокирует этот инстанс (требует вход). Выберите другой или «Авто»'
+          : 'YouTube блокирует все проверенные инстансы. Попробуйте «Перепроверить все» позже');
+        else noty('Не удалось открыть видео: ' + (e.message || e));
+      }
       log('play', e);
     });
   }
